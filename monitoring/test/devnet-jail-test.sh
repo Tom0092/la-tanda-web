@@ -41,7 +41,8 @@ MON_DIR=$(cd "$(dirname "$0")/.." && pwd)
 
 log() { printf '%s  %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 need() { command -v "$1" >/dev/null || { echo "missing: $1" >&2; exit 1; }; }
-need "$LATANDAD"; need jq; need curl; need python3; need docker; need ss
+# pgrep and ss guard the checks below: without them those checks would pass silently.
+need "$LATANDAD"; need jq; need curl; need python3; need docker; need ss; need pgrep
 
 log "WARNING: throwaway devnet test, never run this on a host with a production validator"
 # Runs before anything is created or started, so an abort leaves no trace.
@@ -247,6 +248,15 @@ if ! grep -q 'Devnet test proposal everyone claim' "$WORK/webhook.log"; then
   exit 1
 fi
 log "proposal title arrived without its link and mention"
+# Every alert links back to Prometheus. That link must use PROMETHEUS_EXTERNAL_URL
+# (default http://localhost:19090), not this machine's hostname.
+sources=$(grep -o 'Source: [^\\"]*' "$WORK/webhook.log" | sort -u)
+if [ -z "$sources" ] || grep -qv '^Source: http://localhost:19090/' <<<"$sources"; then
+  log "FAILED: unexpected Source link in the webhook payloads:"
+  printf '    %s\n' "$sources"
+  exit 1
+fi
+log "Source links point to http://localhost:19090, not to the hostname"
 log "done. Logs and webhook payloads are in $WORK"
 if [ "${KEEP_RUNNING:-0}" = 1 ]; then
   log "KEEP_RUNNING=1: devnet and stack keep running, Ctrl+C stops everything"

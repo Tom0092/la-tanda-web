@@ -21,10 +21,18 @@ services:
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}
       - --web.listen-address=127.0.0.1:${PROMETHEUS_PORT:-19090}
+      # Base of the "Source:" link in every alert. Without it Prometheus uses the
+      # server's hostname, which then shows up in Discord.
+      - --web.external-url=${PROMETHEUS_EXTERNAL_URL:-http://localhost:19090}
+      # Keep serving at / even if the external URL has a path (reverse proxy),
+      # so Grafana and the health checks still find the API.
+      - --web.route-prefix=/
     environment:
-      COMETBFT_TARGETS: ${COMETBFT_TARGETS:-localhost:26660}
-      COSMOS_API_TARGETS: ${COSMOS_API_TARGETS:-localhost:1317}
-      NODE_EXPORTER_TARGETS: ${NODE_EXPORTER_TARGETS:-localhost:9100}
+      # "-" instead of ":-" here and for CHAIN_RPC_URL: an empty value in .env
+      # stays empty (= don't scrape / don't use RPC), only a missing one gets the default.
+      COMETBFT_TARGETS: ${COMETBFT_TARGETS-localhost:26660}
+      COSMOS_API_TARGETS: ${COSMOS_API_TARGETS-localhost:1317}
+      NODE_EXPORTER_TARGETS: ${NODE_EXPORTER_TARGETS-localhost:9100}
       EXPORTER_TARGET: 127.0.0.1:${EXPORTER_PORT:-9561}
       ALERTMANAGER_TARGET: 127.0.0.1:${ALERTMANAGER_PORT:-9093}
     volumes:
@@ -90,7 +98,7 @@ services:
     restart: unless-stopped
     environment:
       CHAIN_REST_URL: ${CHAIN_REST_URL:-http://localhost:1317}
-      CHAIN_RPC_URL: ${CHAIN_RPC_URL:-http://localhost:26657}
+      CHAIN_RPC_URL: ${CHAIN_RPC_URL-http://localhost:26657}
       WATCH_VALIDATORS: ${WATCH_VALIDATORS:-}
       POLL_INTERVAL: ${POLL_INTERVAL:-30}
       EXPORTER_LISTEN: 127.0.0.1

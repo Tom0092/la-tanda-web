@@ -60,6 +60,53 @@ tests:
             exp_annotations:
               summary: "Validator recent is jailed"
               description: "ltdvaloper1recent is jailed and earns no rewards. Fix the node, wait for downtime_jail_duration to pass, then send an unjail transaction."
+      # ltdvaloper1tomb was tombstoned for the whole range, as if before Prometheus started.
+      - eval_time: 48h
+        alertname: ValidatorTombstoned
+        exp_alerts: []
+
+  # Network-wide instance: a new tombstone fires for 24 h, an old one never.
+  - interval: 1h
+    input_series:
+      - series: latanda_exporter_watch_list_configured
+        values: 0x30
+      - series: latanda_validator_tombstoned{operator_address="ltdvaloper1new",moniker="new",watched="true"}
+        values: 0 0 1x28
+      - series: latanda_validator_tombstoned{operator_address="ltdvaloper1always",moniker="always",watched="true"}
+        values: 1x30
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: ValidatorTombstoned
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: ValidatorTombstoned
+        exp_alerts:
+          - exp_labels: {severity: critical, operator_address: ltdvaloper1new, moniker: new, watched: "true"}
+            exp_annotations:
+              summary: "Validator new is tombstoned (double sign)"
+              description: "ltdvaloper1new signed two different blocks at the same height. It is jailed permanently, can never unjail, and lost slash_fraction_double_sign of its stake."
+      - eval_time: 24h
+        alertname: ValidatorTombstoned
+        exp_alerts:
+          - exp_labels: {severity: critical, operator_address: ltdvaloper1new, moniker: new, watched: "true"}
+            exp_annotations:
+              summary: "Validator new is tombstoned (double sign)"
+              description: "ltdvaloper1new signed two different blocks at the same height. It is jailed permanently, can never unjail, and lost slash_fraction_double_sign of its stake."
+      - eval_time: 26h
+        alertname: ValidatorTombstoned
+        exp_alerts: []
+
+  # WATCH_VALIDATORS set: ValidatorJailed covers a tombstoned validator, no second alert.
+  - interval: 1h
+    input_series:
+      - series: latanda_exporter_watch_list_configured
+        values: 1x5
+      - series: latanda_validator_tombstoned{operator_address="ltdvaloper1mine",moniker="mine",watched="true"}
+        values: 0 0 1x3
+    alert_rule_test:
+      - eval_time: 3h
+        alertname: ValidatorTombstoned
+        exp_alerts: []
 
   # Missed blocks against signed_blocks_window = 10000: 20% = 2000, 40% = 4000.
   - interval: 1m

@@ -3,9 +3,9 @@
 
 CometBFT's own metrics only describe the node that serves them. Jail status,
 missed blocks, voting power and governance are chain state, so this exporter
-reads them from the Cosmos REST API (and block proposers from CometBFT RPC)
-and publishes them as Prometheus metrics. It only reads public endpoints and
-never needs keys.
+reads them from the Cosmos REST API (and, optionally, block proposers from
+CometBFT RPC) and publishes them as Prometheus metrics. It only reads public
+endpoints and never needs keys.
 
 Configuration is environment-only, see example.env.
 """
@@ -163,6 +163,7 @@ class Poller:
         self.block_time = None        # average seconds per block over the last page
         self.latest_height = 0
         self.latest_block_time = 0.0
+        self.rpc_up = None            # None until the first RPC read, then 1 or 0
 
     def run(self):
         while True:
@@ -218,14 +219,7 @@ class Poller:
                 "jailed_until": parse_time(info.get("jailed_until")) if info else 0.0,
             })
 
-        if self.client.rpc_url:
-            self.update_blocks(by_hex)
-        else:
-            latest = c.rest("/cosmos/base/tendermint/v1beta1/blocks/latest")
-            header = (latest.get("sdk_block") or latest.get("block"))["header"]
-            with self.lock:
-                self.latest_height = int(header["height"])
-                self.latest_block_time = parse_time(header["time"])
+        self.update_height(by_hex)
 
         return {
             "signed_blocks_window": int(slashing["signed_blocks_window"]),
@@ -241,7 +235,47 @@ class Poller:
             } for p in proposals],
         }
 
+    def update_height(self, by_hex):
+        """Height, plus block time and proposers if CHAIN_RPC_URL is set.
+
+        RPC is optional. If it fails, the height comes from REST and the poll still
+        counts, so jail and missed-block data keep flowing. A REST failure still
+        fails the poll, REST is the source of everything else.
+        """
+        if not self.client.rpc_url:
+            self.update_height_from_rest()
+            return
+        try:
+            self.update_blocks(by_hex)
+        except Exception as exc:
+            # Warn once per outage, not on every poll.
+            if self.rpc_up != 0:
+                log.warning("RPC %s failed (%s: %s), taking the height from REST until it answers. "
+                            "Without an RPC endpoint, set CHAIN_RPC_URL empty.",
+                            self.client.rpc_url, type(exc).__name__, exc)
+            else:
+                log.debug("RPC still failing: %s: %s", type(exc).__name__, exc)
+            with self.lock:
+                self.rpc_up = 0
+                # A stale block time would look current on the dashboard.
+                self.block_time = None
+            self.update_height_from_rest()
+            return
+        if self.rpc_up == 0:
+            log.info("RPC %s answers again", self.client.rpc_url)
+        with self.lock:
+            self.rpc_up = 1
+
+    def update_height_from_rest(self):
+        latest = self.client.rest("/cosmos/base/tendermint/v1beta1/blocks/latest")
+        header = (latest.get("sdk_block") or latest.get("block"))["header"]
+        with self.lock:
+            self.latest_height = int(header["height"])
+            self.latest_block_time = parse_time(header["time"])
+
     def update_blocks(self, by_hex):
+        # Changes no state until every RPC call has succeeded, so a failure
+        # halfway leaves nothing half updated.
         status = self.client.rpc("/status")["result"]["sync_info"]
         latest = int(status["latest_block_height"])
         start = self.last_seen_height + 1
@@ -284,9 +318,15 @@ class Collector:
             snap, up, last_success, duration = p.snapshot, p.up, p.last_success, p.last_duration
             proposed = dict(p.proposed)
             block_time, height, block_ts = p.block_time, p.latest_height, p.latest_block_time
+            rpc_up = p.rpc_up
 
         yield GaugeMetricFamily("latanda_exporter_up",
                                 "1 if the last poll of the chain API succeeded.", value=up)
+        if p.client.rpc_url:
+            yield GaugeMetricFamily("latanda_exporter_rpc_up",
+                                    "1 if the last read of CHAIN_RPC_URL succeeded. While 0, the height "
+                                    "comes from REST and blocks proposed and block time are not updated.",
+                                    value=1 if rpc_up else 0)
         yield GaugeMetricFamily("latanda_exporter_last_success_timestamp_seconds",
                                 "Unix time of the last successful poll.", value=last_success)
         yield GaugeMetricFamily("latanda_exporter_poll_duration_seconds",

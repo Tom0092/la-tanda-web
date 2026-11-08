@@ -44,11 +44,14 @@ All settings live in `.env` (template: [`example.env`](example.env)). Nothing el
 | `COSMOS_API_TARGETS` | `localhost:1317` | Cosmos SDK API endpoints for telemetry (`/metrics?format=prometheus`). That endpoint also repeats all CometBFT metrics; Prometheus drops the copies |
 | `NODE_EXPORTER_TARGETS` | `localhost:9100` | node_exporter endpoints |
 | `CHAIN_REST_URL` | `http://localhost:1317` | REST API that latanda-exporter reads chain state from |
-| `CHAIN_RPC_URL` | `http://localhost:26657` | CometBFT RPC, used for blocks proposed and block time. Empty: height from REST only |
+| `CHAIN_RPC_URL` | `http://localhost:26657` | CometBFT RPC, used for blocks proposed and block time. Empty: no RPC, height from REST. If it doesn't answer, latanda-exporter takes the height from REST and logs a warning |
 | `POLL_INTERVAL` | `30` | Seconds between two latanda-exporter polls |
+| `PROMETHEUS_EXTERNAL_URL` | `http://localhost:19090` | Base of the "Source:" link in alert messages (see [Alert rules](#alert-rules)). Behind a reverse proxy, set its URL |
 | `PROMETHEUS_RETENTION` | `30d` | How long Prometheus keeps data |
 | `GRAFANA_LISTEN` / `GRAFANA_PORT` | `127.0.0.1` / `3000` | Where Grafana listens |
 | `PROMETHEUS_PORT`, `ALERTMANAGER_PORT`, `NODE_EXPORTER_PORT`, `EXPORTER_PORT` | `19090`, `9093`, `9100`, `9561` | Local ports of the other services |
+
+The three target lists and `CHAIN_RPC_URL` may be set empty (`COMETBFT_TARGETS=`), which switches them off. A line missing from `.env` gets the default.
 
 Every service uses host networking and listens on `127.0.0.1` only. That way the stack can scrape a node that keeps its metrics on localhost, and the stack opens no new public ports. Prometheus uses `19090`, because `9090` is the default gRPC port of `latandad`.
 
@@ -57,6 +60,8 @@ After changing `.env`, apply it with `docker compose up -d`.
 ### One central instance for many nodes
 
 Set `WATCH_VALIDATORS` empty and list every node in the target variables, for example `COMETBFT_TARGETS=10.0.0.11:26660,10.0.0.12:26660`. `CHAIN_REST_URL` can point to any synced node, because chain state is the same everywhere. The public endpoint `https://latanda.online/chain/api` works too.
+
+Without a node on the monitoring host itself, set `CHAIN_RPC_URL=` empty, or point it to a node's RPC (port 26657). Empty means no blocks proposed and no block time; jail, missed-block, stake and governance data come from REST either way. If the RPC fails, latanda-exporter falls back to the REST height, keeps exporting everything else and logs one warning per outage; `latanda_exporter_rpc_up` shows it. Set a target list empty if there is nothing to scrape, for example `COSMOS_API_TARGETS=` when the nodes don't expose telemetry. Otherwise it defaults to `localhost` and `ScrapeTargetDown` or `NodeDown` fire for a node that doesn't exist.
 
 Remote nodes must then listen on an interface the monitoring host can reach. Allow only the monitoring host's IP in their firewall, e.g. `ufw allow from <monitoring-ip> to any port 26660 proto tcp`.
 
@@ -87,7 +92,7 @@ Current testnet parameters (`/cosmos/slashing/v1beta1/params`): `signed_blocks_w
 
 `for: 1m` on the missed-block alerts filters single noisy polls. The counter itself only moves one block at a time, so the alert is not delayed meaningfully.
 
-**Watched vs. network-wide mode.** With `WATCH_VALIDATORS` set, jail and missed-block alerts cover only those validators, and `ValidatorJailed` keeps firing for as long as the jail lasts. With `WATCH_VALIDATORS` empty, every validator is covered. In that mode `ValidatorJailed` only fires for jails of the **last 24 hours**, computed from `jailed_until`. Otherwise each long-abandoned jailed validator would alert forever (19 of 54 testnet validators were jailed on 2026-10-29). Tombstoned validators (jailed forever after a double sign) are left out in that mode.
+**Watched vs. network-wide mode.** With `WATCH_VALIDATORS` set, jail and missed-block alerts cover only those validators, and `ValidatorJailed` keeps firing for as long as the jail lasts. With `WATCH_VALIDATORS` empty, every validator is covered. In that mode `ValidatorJailed` only fires for jails of the **last 24 hours**, computed from `jailed_until`. Otherwise each long-abandoned jailed validator would alert forever (19 of 54 testnet validators were jailed on 2026-10-29). Tombstoned validators (jailed forever after a double sign) get their own alert in that mode, `ValidatorTombstoned`, for 24 hours after the double sign.
 
 **Additional rules** (not in the original scope, but without them the rules above can go silent):
 
@@ -98,10 +103,13 @@ Current testnet parameters (`/cosmos/slashing/v1beta1/params`): `signed_blocks_w
 | `ScrapeTargetDown` | warning | a telemetry, node_exporter or latanda-exporter target is unreachable for 5 min |
 | `ChainApiUnreachable` | warning | latanda-exporter cannot read `CHAIN_REST_URL` for 5 min. Jail alerts use stale data until then. |
 | `WatchedValidatorNotFound` | warning | an address in `WATCH_VALIDATORS` does not exist on chain (typo). No alerts would fire for it. |
+| `ValidatorTombstoned` | critical | network-wide mode only: a validator became tombstoned (double sign) in the last 24 h. It is jailed permanently and can never unjail. Validators that were already tombstoned when Prometheus started don't fire, so a fresh install doesn't flood Discord. With `WATCH_VALIDATORS` set, `ValidatorJailed` covers this case. |
 
 **Grouping and inhibition** ([`alertmanager/alertmanager.yml`](alertmanager/alertmanager.yml)): a critical missed-block alert suppresses the warning for the same validator. `ValidatorJailed` suppresses both missed-block alerts, because the counter resets at the jail. `NodeDown` suppresses `NodeHeightStalled` and `LowPeerCount` of the same node, and `ScrapeTargetDown` of every target on the same host (the `host` label is the part of the target before the port, so write a machine the same way in all target lists). Unresolved alerts are repeated every 4 h (info: 24 h). Resolved notifications are sent.
 
 **Discord or generic webhook.** The receiver uses Alertmanager's native Discord integration. For any other webhook (Slack-compatible bridges, ntfy, your own service), replace `discord_configs` with `webhook_configs` and `webhook_url_file` with `url_file`, as the comment in `alertmanager.yml` shows.
+
+**Source link.** Every alert message ends with a "Source:" link to the rule in Prometheus. It is built from `PROMETHEUS_EXTERNAL_URL` (default `http://localhost:19090`), so it doesn't reveal the server's hostname and opens through the SSH tunnel from [Operations](#operations).
 
 **Chain-controlled text.** Validator monikers and proposal titles are free text that anyone can set on chain, and they reach Discord through alert labels and annotations. latanda-exporter therefore removes URLs, `@` mentions, markdown links and Discord markup from them before they become labels (`clean_label`). It also replaces a dot in front of a word with a space, so `Vinjan.Inc` shows up as `Vinjan Inc`: Discord would otherwise turn something like `evil.example` into a link. An address spelled out in words ("evil dot example") stays, no filter can catch that. Empty results fall back to `unnamed` or `proposal <id>`.
 
@@ -116,8 +124,8 @@ docker compose exec alertmanager amtool alert add TestAlert severity=info \
 ### How the rules were tested
 
 - `prometheus/alerts.test.yml`: `promtool` unit tests for every rule, including the 24 h logic of the network-wide mode and tombstoned validators. Run from `monitoring/`, with the stack up: `docker compose exec prometheus promtool test rules /etc/prometheus/alerts.test.yml`
-- `exporter/test_exporter.py`: unit tests for the label cleaning and for the poller surviving a malformed API response. Run from `monitoring/`, once the image is built: `docker run --rm -v "$PWD/exporter:/t:ro" --entrypoint python latanda-exporter:1.0.0 -m unittest discover -s /t`
-- [`test/devnet-jail-test.sh`](test/devnet-jail-test.sh): starts a throwaway 2-validator devnet with `signed_blocks_window = 600` and stops the smaller validator. It then checks that warning, critical and jailed fire in that order, that the Discord payloads reach a local webhook, and that a hostile proposal title arrives without its link and mention. It never touches the public testnet, leaves `monitoring/.env` alone, and runs its own copy of the stack with separate volumes that are removed at the end. It needs a `latandad` binary built from the chain source, `jq` and the stack stopped, and takes about 35 minutes: `LATANDAD=/path/to/latandad bash test/devnet-jail-test.sh`
+- `exporter/test_exporter.py`: unit tests for the label cleaning, for the poller surviving a malformed API response, and for the fallback to REST when the RPC fails. Run from `monitoring/`, once the image is built: `docker run --rm -v "$PWD/exporter:/t:ro" --entrypoint python latanda-exporter:1.0.0 -m unittest discover -s /t`
+- [`test/devnet-jail-test.sh`](test/devnet-jail-test.sh): starts a throwaway 2-validator devnet with `signed_blocks_window = 600` and stops the smaller validator. It then checks that warning, critical and jailed fire in that order, that the Discord payloads reach a local webhook, that a hostile proposal title arrives without its link and mention, and that every "Source:" link uses `http://localhost:19090` instead of the hostname. It never touches the public testnet, leaves `monitoring/.env` alone, and runs its own copy of the stack with separate volumes that are removed at the end. It needs a `latandad` binary built from the chain source, `jq` and the stack stopped, and takes about 35 minutes: `LATANDAD=/path/to/latandad bash test/devnet-jail-test.sh`
 
   **Never run it on a host with a production validator, use a throwaway machine.** It starts two validators and a monitoring stack on the default ports. It aborts before doing anything if a `latandad` process is running or one of those ports is taken.
 
@@ -136,6 +144,7 @@ docker compose exec alertmanager amtool alert add TestAlert severity=info \
 | `latanda_slashing_signed_blocks_window`, `_min_signed_per_window`, `_downtime_jail_duration_seconds` | | Slashing params |
 | `latanda_chain_latest_block_height`, `latanda_chain_block_time_seconds` | | Height, average block time over the last 20 blocks |
 | `latanda_exporter_up`, `latanda_exporter_watched_validator_missing` | | Health of the exporter itself |
+| `latanda_exporter_rpc_up` | | 1 if the last RPC read succeeded. Only exported with `CHAIN_RPC_URL` set |
 
 Blocks proposed are counted from new blocks while the exporter runs, there is no history before its start. After a gap of more than 400 blocks (exporter down for ~40 min) it skips ahead instead of fetching the backlog.
 

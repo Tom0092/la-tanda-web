@@ -10,7 +10,7 @@ groups:
       # jailed within the last 24 h, otherwise every long-dead jailed validator
       # fires forever. jailed_until = jail time + downtime_jail_duration.
       # Tombstoned validators (jailed forever after a double sign) are left out
-      # in this mode.
+      # in this mode, ValidatorTombstoned covers them.
       - alert: ValidatorJailed
         expr: |
           (
@@ -29,6 +29,23 @@ groups:
         annotations:
           summary: "Validator {{ $labels.moniker }} is jailed"
           description: "{{ $labels.operator_address }} is jailed and earns no rewards. Fix the node, wait for downtime_jail_duration to pass, then send an unjail transaction."
+
+      # Network-wide instance only (with WATCH_VALIDATORS set, ValidatorJailed keeps
+      # firing for a tombstoned validator). A tombstone's jailed_until lies in the
+      # year 9999, so the 24 h logic above can't see it. Instead this fires for 24 h
+      # after the exporter saw tombstoned change from 0 to 1. Validators that were
+      # already tombstoned when Prometheus started never fire: min_over_time only
+      # sees 1 for them (offset 1d would fire for all of them on a fresh install).
+      - alert: ValidatorTombstoned
+        expr: |
+          latanda_validator_tombstoned == 1
+          and on() latanda_exporter_watch_list_configured == 0
+          and on(operator_address) min_over_time(latanda_validator_tombstoned[1d]) == 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Validator {{ $labels.moniker }} is tombstoned (double sign)"
+          description: "{{ $labels.operator_address }} signed two different blocks at the same height. It is jailed permanently, can never unjail, and lost slash_fraction_double_sign of its stake."
 
       - alert: ValidatorMissedBlocksCritical
         expr: |

@@ -4,12 +4,14 @@ Run from monitoring/ after building the image:
   docker run --rm -v "$PWD/exporter:/t:ro" --entrypoint python latanda-exporter:1.0.0 -m unittest discover -s /t
 """
 
+import os
 import time
 import unittest
+import urllib.error
 from unittest import mock
 
 import latanda_exporter
-from latanda_exporter import Poller, clean_label
+from latanda_exporter import Collector, Poller, clean_label
 
 # (chain-controlled input, expected label)
 ATTACKS = [
@@ -86,11 +88,12 @@ class CleanLabelTest(unittest.TestCase):
 
 
 class FakeClient:
-    """Answers the REST calls of Poller.collect_chain_state."""
+    """Answers the REST calls of Poller.collect_chain_state, and RPC calls if rpc_url is set."""
 
-    rpc_url = ""
-
-    def __init__(self, validators=None, proposals=None):
+    def __init__(self, validators=None, proposals=None, rpc_url=""):
+        self.rpc_url = rpc_url
+        self.rpc_error = None     # raised by every RPC call while set
+        self.rpc_calls = 0
         self.responses = {
             "/cosmos/slashing/v1beta1/params": {"params": {
                 "signed_blocks_window": "10000",
@@ -109,6 +112,20 @@ class FakeClient:
     def rest(self, path, **_params):
         return self.responses[path]
 
+    def rpc(self, path, **params):
+        """A chain at height 7 with one block per second."""
+        self.rpc_calls += 1
+        if self.rpc_error:
+            raise self.rpc_error
+        if path == "/status":
+            return {"result": {"sync_info": {"latest_block_height": "7"}}}
+        if path == "/blockchain":
+            heights = range(int(params["minHeight"]), int(params["maxHeight"]) + 1)
+            return {"result": {"block_metas": [{"header": {
+                "height": str(h), "time": f"2026-11-03T00:00:{h:02d}Z", "proposer_address": "AB",
+            }} for h in heights]}}
+        raise AssertionError(f"unexpected RPC call {path}")
+
 
 class StopLoop(BaseException):
     """Ends the endless Poller.run; not an Exception, so run() cannot catch it."""
@@ -121,6 +138,19 @@ def run_polls(poller, polls=1):
             poller.run()
         except StopLoop:
             pass
+
+
+def exported(poller):
+    """Metric name -> list of (labels, value), as Prometheus would scrape them."""
+    out = {}
+    for family in Collector(poller).collect():
+        for sample in family.samples:
+            out.setdefault(sample.name, []).append((sample.labels, sample.value))
+    return out
+
+
+VALIDATOR = {"operator_address": "ltdvaloper1test", "tokens": "9000000",
+             "description": {"moniker": "heimnetz"}}
 
 
 class PollerTest(unittest.TestCase):
@@ -158,6 +188,87 @@ class PollerTest(unittest.TestCase):
         client.responses["/cosmos/staking/v1beta1/validators"] = good
         run_polls(poller)
         self.assertEqual(poller.up, 1)
+
+
+class RpcTest(unittest.TestCase):
+    """CHAIN_RPC_URL is optional: a failing RPC must not cost the REST data."""
+
+    @staticmethod
+    def refused_client():
+        # A central instance with no local node and CHAIN_RPC_URL left at its default.
+        client = FakeClient(validators=[VALIDATOR], rpc_url="http://localhost:26657")
+        client.rpc_error = urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+        return client
+
+    def test_rpc_failure_keeps_rest_data(self):
+        poller = Poller(self.refused_client(), [], 30)
+        with self.assertLogs("latanda_exporter", level="WARNING") as logs:
+            run_polls(poller, polls=2)
+        self.assertEqual(len(logs.records), 1, "one warning per outage, not one per poll")
+        self.assertIn("CHAIN_RPC_URL empty", logs.output[0])
+        metrics = exported(poller)
+        self.assertEqual(metrics["latanda_exporter_up"][0][1], 1)
+        self.assertEqual(metrics["latanda_exporter_rpc_up"][0][1], 0)
+        self.assertEqual([labels["moniker"] for labels, _ in metrics["latanda_validator_jailed"]],
+                         ["heimnetz"])
+        self.assertEqual(metrics["latanda_validator_voting_power"][0][1], 9)
+        self.assertEqual(metrics["latanda_chain_latest_block_height"][0][1], 5)  # from REST
+        self.assertNotIn("latanda_chain_block_time_seconds", metrics)
+
+    def test_rpc_failure_after_success_drops_block_time(self):
+        client = FakeClient(validators=[VALIDATOR], rpc_url="http://rpc.example:26657")
+        poller = Poller(client, [], 30)
+        run_polls(poller)
+        self.assertEqual(exported(poller)["latanda_chain_block_time_seconds"][0][1], 1.0)
+        client.rpc_error = TimeoutError("timed out")
+        with self.assertLogs("latanda_exporter", level="WARNING") as logs:
+            run_polls(poller)
+        self.assertIn("TimeoutError", logs.output[0])
+        metrics = exported(poller)
+        self.assertEqual(metrics["latanda_exporter_up"][0][1], 1)
+        self.assertEqual(metrics["latanda_exporter_rpc_up"][0][1], 0)
+        self.assertEqual(metrics["latanda_chain_latest_block_height"][0][1], 5)  # from REST
+        self.assertNotIn("latanda_chain_block_time_seconds", metrics)
+
+    def test_rpc_recovers(self):
+        client = self.refused_client()
+        poller = Poller(client, [], 30)
+        with self.assertLogs("latanda_exporter", level="WARNING"):
+            run_polls(poller)
+        client.rpc_error = None
+        with self.assertLogs("latanda_exporter", level="INFO") as logs:
+            run_polls(poller)
+        self.assertIn("answers again", logs.output[-1])
+        metrics = exported(poller)
+        self.assertEqual(metrics["latanda_exporter_rpc_up"][0][1], 1)
+        self.assertEqual(metrics["latanda_chain_latest_block_height"][0][1], 7)  # from RPC
+        self.assertEqual(metrics["latanda_chain_block_time_seconds"][0][1], 1.0)
+
+    def test_rest_failure_still_fails_the_poll(self):
+        client = self.refused_client()
+        del client.responses["/cosmos/base/tendermint/v1beta1/blocks/latest"]
+        poller = Poller(client, [], 30)
+        with self.assertLogs("latanda_exporter", level="WARNING"):
+            run_polls(poller)
+        self.assertEqual(poller.up, 0)
+
+    def test_empty_rpc_url_never_calls_rpc(self):
+        client = FakeClient(validators=[VALIDATOR])
+        poller = Poller(client, [], 30)
+        with self.assertNoLogs("latanda_exporter", level="WARNING"):
+            run_polls(poller, polls=2)
+        self.assertEqual(client.rpc_calls, 0)
+        metrics = exported(poller)
+        self.assertEqual(metrics["latanda_exporter_up"][0][1], 1)
+        self.assertNotIn("latanda_exporter_rpc_up", metrics)
+        self.assertNotIn("latanda_validator_blocks_proposed_total", metrics)
+        self.assertEqual(metrics["latanda_chain_latest_block_height"][0][1], 5)
+
+    def test_empty_env_value_switches_rpc_off(self):
+        # docker-compose.yml passes CHAIN_RPC_URL with "-", not ":-", so an empty
+        # value in .env reaches the exporter as an empty string.
+        with mock.patch.dict(os.environ, {"CHAIN_RPC_URL": ""}):
+            self.assertEqual(latanda_exporter.env_str("CHAIN_RPC_URL", "http://localhost:26657"), "")
 
 
 if __name__ == "__main__":
